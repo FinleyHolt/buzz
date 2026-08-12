@@ -41,6 +41,17 @@ const IN_FLIGHT_DEADLINE_BUFFER_SECS: u64 = 100;
 /// Default in-flight deadline: default max_turn (7200s) + 100s buffer.
 const DEFAULT_IN_FLIGHT_DEADLINE_SECS: u64 = 7300;
 
+/// Cap on total in-flight residency as a multiple of the per-turn deadline.
+///
+/// Successful mid-turn steers extend the in-flight deadline
+/// ([`EventQueue::extend_in_flight_deadline`]); without a cap, a steady
+/// trickle of steerable events keeps one turn in-flight forever, silently
+/// starving every queued event for that channel (the "extension treadmill").
+/// The cap bounds total residency to `factor × in_flight_deadline` measured
+/// from dispatch, after which extensions stop and the normal expiry backstop
+/// reclaims the channel.
+const MAX_IN_FLIGHT_TOTAL_FACTOR: u32 = 2;
+
 /// An event waiting in the queue.
 #[derive(Debug, Clone)]
 pub struct QueuedEvent {
@@ -139,6 +150,9 @@ pub struct EventQueue {
     in_flight_channels: HashSet<Uuid>,
     /// Per-channel deadline for auto-expiring stuck in-flight entries.
     in_flight_deadlines: HashMap<Uuid, Instant>,
+    /// When each in-flight channel was dispatched — anchors the total
+    /// residency cap for deadline extensions (see [`MAX_IN_FLIGHT_TOTAL_FACTOR`]).
+    in_flight_started: HashMap<Uuid, Instant>,
     /// Number of events in each in-flight batch (for expiry logging).
     in_flight_batch_sizes: HashMap<Uuid, usize>,
     retry_after: HashMap<Uuid, Instant>,
@@ -181,6 +195,7 @@ impl EventQueue {
             queues: HashMap::new(),
             in_flight_channels: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
+            in_flight_started: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
@@ -207,10 +222,34 @@ impl EventQueue {
     /// moves backward. If the channel is not in-flight (already completed
     /// via `mark_complete`), this is a no-op: a late ack never resurrects
     /// a deadline.
+    ///
+    /// Total residency is capped at [`MAX_IN_FLIGHT_TOTAL_FACTOR`] ×
+    /// `in_flight_deadline` from dispatch: beyond the cap, extensions stop
+    /// (WARN) so a channel receiving a steady trickle of steerable events
+    /// cannot keep one turn in-flight forever while its queue starves.
     pub fn extend_in_flight_deadline(&mut self, channel_id: Uuid, max_turn_secs: u64) {
         if let Some(current) = self.in_flight_deadlines.get_mut(&channel_id) {
+            let cap = self
+                .in_flight_started
+                .get(&channel_id)
+                .map(|started| *started + self.in_flight_deadline * MAX_IN_FLIGHT_TOTAL_FACTOR);
             let extended = Instant::now()
                 + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+            let extended = match cap {
+                Some(cap) if extended > cap => {
+                    if cap <= *current {
+                        tracing::warn!(
+                            %channel_id,
+                            factor = MAX_IN_FLIGHT_TOTAL_FACTOR,
+                            "in-flight extension cap reached — turn keeps its current \
+                             deadline; queued events flush when it completes or expires"
+                        );
+                        return;
+                    }
+                    cap
+                }
+                _ => extended,
+            };
             if extended > *current {
                 tracing::info!(
                     %channel_id,
@@ -278,6 +317,7 @@ impl EventQueue {
             );
             self.in_flight_channels.remove(&id);
             self.in_flight_deadlines.remove(&id);
+            self.in_flight_started.remove(&id);
             // Recover any withheld goose-native steer events for the expired
             // channel back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -319,6 +359,7 @@ impl EventQueue {
                         self.in_flight_channels.insert(id);
                         self.in_flight_deadlines
                             .insert(id, now + self.in_flight_deadline);
+                        self.in_flight_started.insert(id, now);
                         self.in_flight_batch_sizes.insert(id, cancelled.len());
                         return Some(FlushBatch {
                             channel_id: id,
@@ -333,8 +374,27 @@ impl EventQueue {
         };
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
+        //
+        // Batches never mix thread scopes: `format_prompt` derives its scope
+        // and reply anchor from the LAST event of the batch, so merging a
+        // top-level mention into a batch that ends in a thread reply silently
+        // re-anchors the mention into that thread — it gets no top-level turn
+        // and no top-level reply. Drain only the head run of events sharing
+        // the head event's thread root (`None` = top-level); the remainder
+        // flushes as its own correctly-scoped batch on the next cycle.
         let queue = self.queues.entry(channel_id).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        let head_scope = queue
+            .front()
+            .map(|qe| parse_thread_tags(&qe.event).root_event_id);
+        let drain_count = queue
+            .iter()
+            .take(MAX_BATCH_EVENTS)
+            .take_while(|qe| Some(parse_thread_tags(&qe.event).root_event_id) == head_scope)
+            .count()
+            // The head event always matches its own scope; guard against a
+            // degenerate zero-length drain all the same.
+            .max(1)
+            .min(queue.len());
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -357,6 +417,7 @@ impl EventQueue {
         self.in_flight_channels.insert(channel_id);
         self.in_flight_deadlines
             .insert(channel_id, now + self.in_flight_deadline);
+        self.in_flight_started.insert(channel_id, now);
         self.in_flight_batch_sizes.insert(channel_id, events.len());
 
         // Merge any cancelled events stored by requeue_as_cancelled().
@@ -392,6 +453,7 @@ impl EventQueue {
     pub fn mark_complete(&mut self, channel_id: Uuid) {
         self.in_flight_channels.remove(&channel_id);
         self.in_flight_deadlines.remove(&channel_id);
+        self.in_flight_started.remove(&channel_id);
         self.in_flight_batch_sizes.remove(&channel_id);
         let now = Instant::now();
         match self.retry_after.get(&channel_id) {
@@ -574,6 +636,7 @@ impl EventQueue {
             );
             self.in_flight_channels.remove(&id);
             self.in_flight_deadlines.remove(&id);
+            self.in_flight_started.remove(&id);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired channel so they are
             // not permanently orphaned in the side table.
@@ -734,6 +797,36 @@ impl EventQueue {
         }
     }
 
+    /// Whether the withheld steered event `event_id` is a **top-level
+    /// mention** of this agent: no thread root (zero NIP-10 `e` markers) and
+    /// a `p` tag naming `agent_pubkey_hex`.
+    ///
+    /// Used by the steer-ack Success arm to decide between consuming the
+    /// event (thread replies — the steer delivered them into the right
+    /// conversation) and requeueing it (top-level mentions — a bare mid-turn
+    /// steer delta carries no reply anchor, so absorbing one silently costs
+    /// the sender their answer; requeueing gives it its own anchored turn
+    /// after the current one). Returns `false` when the event is not
+    /// withheld for this channel.
+    pub fn withheld_is_top_level_mention(
+        &self,
+        channel_id: Uuid,
+        event_id: &str,
+        agent_pubkey_hex: &str,
+    ) -> bool {
+        self.withheld_native_steer
+            .get(&channel_id)
+            .and_then(|entries| entries.iter().find(|qe| qe.event.id.to_hex() == event_id))
+            .is_some_and(|qe| {
+                let tags = parse_thread_tags(&qe.event);
+                tags.root_event_id.is_none()
+                    && tags
+                        .mentioned_pubkeys
+                        .iter()
+                        .any(|pk| pk.eq_ignore_ascii_case(agent_pubkey_hex))
+            })
+    }
+
     /// Drop a specific event by id from both the side table and the main
     /// queue.
     ///
@@ -791,6 +884,18 @@ impl EventQueue {
             "in-flight expiry recovered withheld steer event(s) — \
              steer ack never arrived; normal dispatch will deliver"
         );
+    }
+
+    /// Age of every in-flight channel (time since dispatch), for periodic
+    /// health reporting. A turn older than `max_turn_duration` that is still
+    /// in-flight is being kept alive by steer extensions — visible here long
+    /// before the expiry backstop fires.
+    pub fn in_flight_ages(&self) -> Vec<(Uuid, Duration)> {
+        let now = Instant::now();
+        self.in_flight_started
+            .iter()
+            .map(|(id, started)| (*id, now.saturating_duration_since(*started)))
+            .collect()
     }
 
     /// Compact expired metadata entries to prevent unbounded map growth.
@@ -4960,5 +5065,142 @@ mod tests {
             after_second >= after_first,
             "second extend must not move deadline backward (monotonic)"
         );
+    }
+
+    #[test]
+    fn extend_in_flight_deadline_capped_at_total_residency() {
+        let ch = Uuid::new_v4();
+        // in_flight_deadline = 10 + 100 (buffer) = 110s; cap = started + 220s.
+        let mut q = EventQueue::new(DedupMode::Queue).with_in_flight_deadline(10);
+        q.push(make_queued(ch, "hello"));
+        let batch = q.flush_next().expect("batch");
+        assert_eq!(batch.channel_id, ch);
+        let started = *q.in_flight_started.get(&ch).expect("started tracked");
+        let cap = started + q.in_flight_deadline * MAX_IN_FLIGHT_TOTAL_FACTOR;
+
+        // An extension that would exceed the cap is clamped to it.
+        q.extend_in_flight_deadline(ch, 10_000);
+        assert_eq!(*q.in_flight_deadlines.get(&ch).unwrap(), cap);
+
+        // Further extensions cannot move past the cap (treadmill stopped).
+        q.extend_in_flight_deadline(ch, 10_000);
+        assert_eq!(*q.in_flight_deadlines.get(&ch).unwrap(), cap);
+
+        // mark_complete clears the residency anchor.
+        q.mark_complete(ch);
+        assert!(!q.in_flight_started.contains_key(&ch));
+    }
+
+    #[test]
+    fn flush_next_does_not_mix_thread_scopes() {
+        let ch = Uuid::new_v4();
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let root = "a".repeat(64);
+        let reply = make_event_with_tags(
+            "in thread",
+            vec![vec![
+                "e".to_string(),
+                root.clone(),
+                String::new(),
+                "root".to_string(),
+            ]],
+        );
+        q.push(make_queued(ch, "top-level one"));
+        q.push(QueuedEvent {
+            channel_id: ch,
+            event: reply,
+            received_at: Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        q.push(make_queued(ch, "top-level two"));
+
+        // Head run = only the first top-level event: the thread reply breaks
+        // the scope run, so it cannot become the batch's LAST event and
+        // re-anchor the mention into its thread.
+        let b1 = q.flush_next().expect("first batch");
+        assert_eq!(b1.events.len(), 1);
+        assert_eq!(b1.events[0].event.content, "top-level one");
+        q.mark_complete(ch);
+
+        let b2 = q.flush_next().expect("second batch");
+        assert_eq!(b2.events.len(), 1);
+        assert_eq!(b2.events[0].event.content, "in thread");
+        q.mark_complete(ch);
+
+        let b3 = q.flush_next().expect("third batch");
+        assert_eq!(b3.events.len(), 1);
+        assert_eq!(b3.events[0].event.content, "top-level two");
+        q.mark_complete(ch);
+        assert!(q.flush_next().is_none());
+    }
+
+    #[test]
+    fn flush_next_batches_same_thread_scope_together() {
+        let ch = Uuid::new_v4();
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let root = "a".repeat(64);
+        for content in ["reply one", "reply two"] {
+            q.push(QueuedEvent {
+                channel_id: ch,
+                event: make_event_with_tags(
+                    content,
+                    vec![vec![
+                        "e".to_string(),
+                        root.clone(),
+                        String::new(),
+                        "root".to_string(),
+                    ]],
+                ),
+                received_at: Instant::now(),
+                prompt_tag: "test".into(),
+            });
+        }
+        let batch = q.flush_next().expect("batch");
+        assert_eq!(batch.events.len(), 2, "same-scope events still merge");
+    }
+
+    #[test]
+    fn withheld_top_level_mention_detection() {
+        let ch = Uuid::new_v4();
+        let agent_pk = "b".repeat(64);
+        let other_pk = "c".repeat(64);
+        let mut q = EventQueue::new(DedupMode::Queue);
+
+        let mention = make_event_with_tags("ping", vec![vec!["p".to_string(), agent_pk.clone()]]);
+        let mention_id = mention.id.to_hex();
+        q.push(QueuedEvent {
+            channel_id: ch,
+            event: mention,
+            received_at: Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        assert!(q.mark_native_steer_pending(ch, &mention_id));
+        assert!(q.withheld_is_top_level_mention(ch, &mention_id, &agent_pk));
+        assert!(
+            !q.withheld_is_top_level_mention(ch, &mention_id, &other_pk),
+            "p tag names a different agent"
+        );
+
+        // A thread reply mentioning the agent is NOT top-level.
+        let root = "d".repeat(64);
+        let threaded = make_event_with_tags(
+            "threaded ping",
+            vec![
+                vec!["p".to_string(), agent_pk.clone()],
+                vec!["e".to_string(), root, String::new(), "root".to_string()],
+            ],
+        );
+        let threaded_id = threaded.id.to_hex();
+        q.push(QueuedEvent {
+            channel_id: ch,
+            event: threaded,
+            received_at: Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        assert!(q.mark_native_steer_pending(ch, &threaded_id));
+        assert!(!q.withheld_is_top_level_mention(ch, &threaded_id, &agent_pk));
+
+        // Unknown event id: false.
+        assert!(!q.withheld_is_top_level_mention(ch, &"9".repeat(64), &agent_pk));
     }
 }

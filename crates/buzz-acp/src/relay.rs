@@ -536,6 +536,14 @@ enum RelayCommand {
     PublishEvent { event: Box<Event> },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
     SetStartupWatermark { ts: u64 },
+    /// Report the channels the background task currently holds subscriptions
+    /// for (subscription *intent* while disconnected). Lets the harness loop
+    /// reconcile its own subscribed-channel set against the background task's
+    /// — the two can silently diverge when an access-denied CLOSED drops a
+    /// channel here without the harness loop learning.
+    ReportSubscriptions {
+        reply: tokio::sync::oneshot::Sender<Vec<Uuid>>,
+    },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -818,6 +826,22 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)?;
         debug!("queued unsubscribe for channel {channel_id}");
         Ok(())
+    }
+
+    /// The channels the background task currently holds subscriptions for
+    /// (subscription *intent* while disconnected — what a reconnect restores).
+    ///
+    /// The harness loop uses this to reconcile its own subscribed-channel set
+    /// against the background task's: an access-denied CLOSED silently drops
+    /// a channel from the background state, and without reconciliation the
+    /// harness keeps believing (and advertising) the channel is live.
+    pub async fn active_channels(&self) -> Result<Vec<Uuid>, RelayError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RelayCommand::ReportSubscriptions { reply })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        rx.await.map_err(|_| RelayError::ConnectionClosed)
     }
 
     /// Wait for the next event from any subscribed channel.
@@ -1293,6 +1317,9 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                 state.membership_last_seen = Some(ts);
             }
         }
+        RelayCommand::ReportSubscriptions { reply } => {
+            let _ = reply.send(state.active_subscriptions.keys().copied().collect());
+        }
         // Observer telemetry frames are durable: park them (bounded, visible
         // overflow) so they are delivered by the post-reconnect drain. Other
         // ephemeral publishes (typing indicators) are meaningless while
@@ -1529,6 +1556,10 @@ async fn execute_connected_command(
                 state.membership_last_seen = Some(ts);
             }
             debug!("startup watermark set to {ts}");
+            true
+        }
+        RelayCommand::ReportSubscriptions { reply } => {
+            let _ = reply.send(state.active_subscriptions.keys().copied().collect());
             true
         }
         // Control-flow commands — callers handle these before dispatching.
