@@ -1816,6 +1816,11 @@ async fn tokio_main() -> Result<()> {
             Duration::ZERO,
         ));
 
+    // Presence ticks since start — every 5th tick (~5 min at the 60s heartbeat)
+    // runs a subscription reconciliation against the relay background task
+    // (see the presence-heartbeat arm).
+    let mut presence_tick_count: u32 = 0;
+
     if config.lazy_pool {
         emit_runtime_lifecycle(
             observer.as_ref(),
@@ -2288,7 +2293,27 @@ async fn tokio_main() -> Result<()> {
                                     removed_channels.remove(&ch);
 
                                     if subscribed_channel_ids.contains(&ch) {
-                                        tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
+                                        // Re-assert instead of no-op: the relay
+                                        // re-emits member-added specifically as a
+                                        // resubscribe heal (e.g. after unarchive),
+                                        // and the background task may have dropped
+                                        // this channel's REQ on an access-denied
+                                        // CLOSED without this loop ever learning.
+                                        // A repeated REQ for the same sub id is an
+                                        // idempotent server-side replace, so
+                                        // re-subscribing is safe when the sub is
+                                        // in fact still live.
+                                        match config::resolve_dynamic_channel_filter(&config, ch, &rules) {
+                                            Some(filter) => {
+                                                tracing::info!(channel_id = %ch, "membership notification: re-asserting existing subscription");
+                                                if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
+                                                    tracing::warn!("failed to re-assert subscription for channel {ch}: {e}");
+                                                }
+                                            }
+                                            None => {
+                                                tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed (no rules to re-assert)");
+                                            }
+                                        }
                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
@@ -2495,13 +2520,33 @@ async fn tokio_main() -> Result<()> {
                                 )
                                 .await;
                                 if !allowed {
-                                    tracing::debug!(
-                                        channel_id = %buzz_event.channel_id,
-                                        author = %buzz_event.event.pubkey.to_hex(),
-                                        mode = %config.respond_to,
-                                        is_dm,
-                                        "inbound author gate — dropping event"
-                                    );
+                                    // A dropped event that explicitly p-tags
+                                    // this agent is someone trying to reach it
+                                    // and silently failing — that is the
+                                    // operator-facing signal that respond_to
+                                    // is narrower than users expect (the
+                                    // "agents ignoring people" incident), so
+                                    // it logs at WARN. Everything else stays
+                                    // at debug.
+                                    if event_mentions_agent(&buzz_event.event, &pubkey_hex) {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %buzz_event.event.pubkey.to_hex(),
+                                            event_id = %buzz_event.event.id.to_hex(),
+                                            mode = %config.respond_to,
+                                            is_dm,
+                                            "author gate dropped a mention addressed to this \
+                                             agent — sender is not authorized by respond_to"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %buzz_event.event.pubkey.to_hex(),
+                                            mode = %config.respond_to,
+                                            is_dm,
+                                            "inbound author gate — dropping event"
+                                        );
+                                    }
                                     continue;
                                 }
                             }
@@ -2583,11 +2628,23 @@ async fn tokio_main() -> Result<()> {
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
                                         );
-                                    if !native_attempted {
-                                        signal_in_flight_task(
+                                    if !native_attempted
+                                        && !signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
                                             signal,
+                                        )
+                                    {
+                                        // No receiver: the turn's one-shot
+                                        // control channel was already consumed
+                                        // (or the task is between states). The
+                                        // event stays queued and flushes when
+                                        // the turn completes or expires — log
+                                        // it so a wedged channel is visible.
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "mid-turn signal had no receiver — event stays \
+                                             queued until the in-flight turn completes"
                                         );
                                     }
                                 }
@@ -2673,6 +2730,96 @@ async fn tokio_main() -> Result<()> {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
+                    // Periodic subscription reconciliation: presence proves only
+                    // that the socket can write frames — it says nothing about
+                    // per-channel REQ health. Compare this loop's tracked set
+                    // against the background task's and heal any channel the
+                    // background silently dropped (access-denied CLOSED), so a
+                    // session cannot stay "online but dark" indefinitely. Also
+                    // surface turns held in-flight past max_turn_duration by
+                    // steer extensions.
+                    presence_tick_count = presence_tick_count.wrapping_add(1);
+                    if presence_tick_count.is_multiple_of(5) {
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            relay.active_channels(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(bg_channels)) => {
+                                let bg: HashSet<uuid::Uuid> =
+                                    bg_channels.into_iter().collect();
+                                let missing: Vec<uuid::Uuid> = subscribed_channel_ids
+                                    .difference(&bg)
+                                    .copied()
+                                    .collect();
+                                let overdue: Vec<String> = queue
+                                    .in_flight_ages()
+                                    .into_iter()
+                                    .filter(|(_, age)| {
+                                        age.as_secs() > config.max_turn_duration_secs
+                                    })
+                                    .map(|(ch, age)| format!("{ch}={}s", age.as_secs()))
+                                    .collect();
+                                if !overdue.is_empty() {
+                                    tracing::warn!(
+                                        turns = ?overdue,
+                                        "in-flight turn(s) older than max_turn_duration — \
+                                         kept alive by steer extensions; queued events wait"
+                                    );
+                                }
+                                if missing.is_empty() {
+                                    tracing::debug!(
+                                        subscribed = subscribed_channel_ids.len(),
+                                        "subscription reconciliation: consistent"
+                                    );
+                                }
+                                for ch in missing {
+                                    // Replay from a bounded window (one
+                                    // reconciliation period) — the drop point is
+                                    // unknown, and the relay-layer duplicate drop
+                                    // absorbs any overlap.
+                                    let since = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        .saturating_sub(300);
+                                    match config::resolve_dynamic_channel_filter(&config, ch, &rules) {
+                                        Some(filter) => {
+                                            tracing::warn!(
+                                                channel_id = %ch,
+                                                "subscription reconciliation: background task \
+                                                 lost this channel — re-subscribing"
+                                            );
+                                            if let Err(e) = relay
+                                                .subscribe_channel_from(ch, filter, Some(since))
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    "reconciliation resubscribe failed for {ch}: {e}"
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                channel_id = %ch,
+                                                "subscription reconciliation: background task \
+                                                 lost this channel and no rules match — \
+                                                 removing from tracked set"
+                                            );
+                                            subscribed_channel_ids.remove(&ch);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!("subscription reconciliation skipped: {e}");
+                            }
+                            Err(_) => {
+                                tracing::debug!("subscription reconciliation timed out");
+                            }
+                        }
+                    }
                     None
                 }
                 _ = async {
@@ -2853,7 +3000,7 @@ async fn tokio_main() -> Result<()> {
                 //     pending_steer on every return path. If it does,
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
-                let (release_withheld, drop_withheld, signal_fallback) = match &ack {
+                let (mut release_withheld, mut drop_withheld, signal_fallback) = match &ack {
                     Ok(pool::SteerAck::Success { .. }) => (false, true, false),
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
@@ -2878,6 +3025,27 @@ async fn tokio_main() -> Result<()> {
                     Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
                     Err(_recv_err) => (true, false, false),
                 };
+                // A successfully steered TOP-LEVEL MENTION must still get its
+                // own turn: the steer body is a bare context delta with no
+                // reply anchor, so consuming the event here silently absorbs
+                // the mention into whatever thread the turn was working on —
+                // the sender never gets a top-level reply (the
+                // "agents-ignoring-people" failure mode). Requeue it instead;
+                // it flushes as its own correctly-anchored batch when the
+                // current turn completes. Thread replies keep the consume
+                // path — the steer delivered them into the right conversation.
+                if drop_withheld
+                    && queue.withheld_is_top_level_mention(channel_id, &event_id, &pubkey_hex)
+                {
+                    tracing::info!(
+                        channel = %channel_id,
+                        event_id = %event_id,
+                        "steered event is a top-level mention — requeueing for its \
+                         own anchored turn instead of consuming"
+                    );
+                    drop_withheld = false;
+                    release_withheld = true;
+                }
                 tracing::info!(
                     channel = %channel_id,
                     event_id = %event_id,
